@@ -43,6 +43,7 @@ local ScratchBuffer = buffer.create(64)
 local ScratchInstances = {}
 
 --> Single reusable slot for Save/Load round-trips, these are never nested.
+--> They aren't exception safe either: an error mid-write skips Load(Stash), see DetachScratch.
 local Stash: BufferSave = {
     Size = 0,
     Cursor = 0,
@@ -82,6 +83,15 @@ local function Load(Save: BufferSave?)
     SendOffset = 0
     SendBuffer = buffer.create(64)
     SendInstances = {}
+end
+
+--> Client only: if a scratch write errored before Load(Stash) ran, the reliable send state was left pointing at
+--> the scratch buffer. Give scratch new storage so the next scratch write can't overwrite pending reliable data.
+local function DetachScratch()
+    if SendInstances == ScratchInstances then
+        ScratchBuffer = buffer.create(64)
+        ScratchInstances = {}
+    end
 end
 
 local function LoadScratch()
@@ -170,5 +180,53 @@ local Queue: any = {
     Reliable = {},
     Unreliable = {}
 }
+
+--> Shared listener bodies, every event reuses these instead of emitting its own copies
+local function SingleListener(Channel: string, Index: number, Async: boolean, Queued: boolean)
+    local Connections = Events[Channel]
+    local Queues = Queue[Channel]
+    return function(Listener: (...any) -> ()): () -> ()
+        Connections[Index] = Listener
+        if Queued then
+            for _, Arguments in Queues[Index] do
+                if Async then
+                    task.spawn(Listener, table.unpack(Arguments))
+                else
+                    Listener(table.unpack(Arguments))
+                end
+            end
+            Queues[Index] = {}
+        end
+        return function(): ()
+            if Connections[Index] == Listener then
+                Connections[Index] = nil
+            end
+        end
+    end
+end
+
+local function ManyListener(Channel: string, Index: number, Async: boolean, Queued: boolean)
+    local Connections = Events[Channel][Index]
+    local Queues = Queue[Channel]
+    return function(Listener: (...any) -> ()): () -> ()
+        table.insert(Connections, Listener)
+        if Queued then
+            for _, Arguments in Queues[Index] do
+                if Async then
+                    task.spawn(Listener, table.unpack(Arguments))
+                else
+                    Listener(table.unpack(Arguments))
+                end
+            end
+            Queues[Index] = {}
+        end
+        return function(): ()
+            local Index = table.find(Connections, Listener)
+            if Index ~= nil then
+                table.remove(Connections, Index)
+            end
+        end
+    end
+end
 
 ]]

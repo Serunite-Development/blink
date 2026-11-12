@@ -23,4 +23,18 @@ local function StepReplication()
     SendOffset = 0
     table.clear(SendInstances)
 end
+
+--> Shared unreliable Fire body, every event reuses this instead of emitting its own copy
+local function UnreliableFire(Write: (...any) -> ())
+    return function(...)
+        DetachScratch()
+        Save(Stash)
+        LoadScratch()
+        Write(...)
+        local Buffer = buffer.create(SendCursor)
+        buffer.copy(Buffer, 0, SendBuffer, 0, SendCursor)
+        Unreliable:FireServer(Buffer, SendInstances)
+        Load(Stash)
+    end
+end
 ]]
