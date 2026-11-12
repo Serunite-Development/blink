@@ -34,7 +34,6 @@ export type Block = typeof(setmetatable(
 		Content: { string },
 		Operation: Operation,
 		Variables: { [string]: boolean },
-		OperationOffset: number,
 	},
 	Block
 ))
@@ -54,7 +53,6 @@ function Block.new<Parent>(Parent: Block?, Unique: string?): Block
 			Counts = 0,
 		},
 		Variables = {},
-		OperationOffset = 0,
 	}, Block)
 end
 
@@ -83,15 +81,8 @@ function Block._operation(self: Block, Method: Method, Bytes: number): string
 	Operation.Bytes += Bytes
 	Operation.Method = Method
 
-	if self.Unique ~= DEFAULT_UNIQUE then
-		self:Comment(`{Method} {Bytes}`)
-		local OperationOffset = `OPERATION_OFFSET_{self.OperationOffset}`
-		self.OperationOffset += 1
-		self:Line(`local {OperationOffset} = {self.Unique}`)
-		self:Line(`{self.Unique} += {Bytes}`)
-		return OperationOffset
-	end
-
+	--> Loop blocks advance their cursor once per iteration in End, so every operation is a constant offset
+	--> (a local per operation is slower and runs into the 200 local limit on large structs)
 	return `{self.Unique} + {Offset}`
 end
 
@@ -261,6 +252,12 @@ end
 
 function Block.End(self: Block): Block
 	self:_appendOperations()
+
+	--> Advance loop cursor past this iteration's fixed size operations
+	local Operation = self.Operation
+	if self.Unique ~= DEFAULT_UNIQUE and not self.Unsafe and Operation.Method ~= "None" and Operation.Bytes > 0 then
+		self:Line(`{self.Unique} += {Operation.Bytes}`)
+	end
 
 	local Parent = self.Parent
 	if Parent then

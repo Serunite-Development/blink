@@ -55,22 +55,6 @@ local EVENT_SYNC_VALIDATION = {
 	"SerdesThread = coroutine.running()\n",
 }
 
-local RELIABLE_BODY = {
-	Header = "local Buffer, Size, Instances = SendBuffer, SendCursor, SendInstances",
-	Body = {
-		"Load(PlayersMap[Player])\n",
-		"local Position = Allocate(Size)\n",
-		"buffer.copy(SendBuffer, Position, Buffer, 0, Size)\n",
-		"table.move(Instances, 1, #Instances, #SendInstances + 1, SendInstances)\n",
-		"PlayersMap[Player] = Save()\n",
-	},
-}
-
-local UNRELIABLE_BODY = {
-	"local Buffer = buffer.create(SendCursor)\n",
-	"buffer.copy(Buffer, 0, SendBuffer, 0, SendCursor)\n",
-}
-
 local IGNORED_TYPES_IN_SHARED = {
 	Event = true,
 	Function = true,
@@ -90,6 +74,50 @@ local UserTypes: Builder.Builder
 local LuauTypes: Builder.Builder
 local Reliables: Blocks.Block
 local Unreliables: Blocks.Block
+
+type DispatchEntry = { Index: number, Block: Blocks.Block }
+local Dispatch: { [string]: { DispatchEntry } } = {
+	Reliable = {},
+	Unreliable = {},
+}
+
+--> Creates the recieve block for an event index, they're assembled into a dispatch tree once all are known
+local function DispatchBlock(Channel: string, Index: number): Blocks.Block
+	local Loop = (Channel == "Unreliable") and Unreliables or Reliables
+	local Block = Blocks.Block(Loop)
+	table.insert(Dispatch[Channel], { Index = Index, Block = Block })
+	return Block
+end
+
+--> Emits a balanced binary search over event indices so dispatch costs O(log n) comparisons instead of O(n)
+local LINEAR_DISPATCH_THRESHOLD = 4
+local function EmitDispatch(Loop: Blocks.Block, Entries: { DispatchEntry }, Low: number, High: number, Depth: number)
+	local Indent = Loop.Indent + Depth
+	if High - Low + 1 <= LINEAR_DISPATCH_THRESHOLD then
+		for Position = Low, High do
+			local Entry = Entries[Position]
+			local Keyword = (Position == Low) and "if" or "elseif"
+			Loop:Line(`{Keyword} Index == {Entry.Index} then`, Indent)
+
+			local Block = Entry.Block
+			Block:_appendOperations()
+			local Extra = string.rep("\t", Depth)
+			for _, Line in Block.Content do
+				Loop:Character(`{Extra}{Line}`)
+			end
+		end
+
+		Loop:Line("end", Indent)
+		return
+	end
+
+	local Middle = (Low + High + 1) // 2
+	Loop:Line(`if Index < {Entries[Middle].Index} then`, Indent)
+	EmitDispatch(Loop, Entries, Low, Middle - 1, Depth + 1)
+	Loop:Line("else", Indent)
+	EmitDispatch(Loop, Entries, Middle, High, Depth + 1)
+	Loop:Line("end", Indent)
+end
 local Return: Builder.Builder
 local Options: Parser.Options
 
@@ -259,15 +287,96 @@ function Declarations.Map(Declaration: Parser.Map, Read: Blocks.Block, Write: Bl
 	Write:Line(`buffer.writeu16(SendBuffer, {ElementsAllocation}, {ElementsVariable})`)
 end
 
+--> Extra key a tagged enum variant wants reserved in its struct constructor
+local PendingTagKey: { Variable: string, Key: string }? = nil
+
+--> Fixed size primitives whose read is a single expression, so they can go straight into a struct constructor
+local INLINE_READ_SIZES = { u8 = 1, u16 = 2, u32 = 4, i8 = 1, i16 = 2, i32 = 4, f32 = 4, f64 = 8, boolean = 1 }
+
+local function IsInlineRead(Field: Type): boolean
+	if Field.Type == "Primitive" then
+		return INLINE_READ_SIZES[(Field :: Parser.Primitive).Tokens.Primitive.Value] ~= nil
+	elseif Field.Type == "Struct" then
+		for _, Child in (Field :: Parser.Struct).Value.Values do
+			if not IsInlineRead(Child :: Type) then
+				return false
+			end
+		end
+		return true
+	end
+
+	return false
+end
+
+--> Emits the write side and read validations of an inlineable field as usual, returns its read expression
+local function InlineRead(Field: Type, Read: Blocks.Block, Write: Blocks.Block, Variable: string): string
+	if Field.Type == "Struct" then
+		local Entries = {}
+		for _, Child in (Field :: Parser.Struct).Value.Values do
+			local Name = Child.Name
+			local ChildVariable = `{Variable}{FormatIndex(Name)}`
+			table.insert(Entries, `{FormatKey(Name)} = {InlineRead(Child :: Type, Read, Write, ChildVariable)}`)
+		end
+		return `\{{table.concat(Entries, ", ")}\}`
+	end
+
+	local Kind = (Field :: Parser.Primitive).Tokens.Primitive.Value
+	local Size = INLINE_READ_SIZES[Kind]
+
+	--> Let the primitive generate its write and validations, its read statement goes to a throwaway block
+	local Discard = Blocks.Block()
+	Primitives[Kind].Generate(Field :: Parser.Primitive, Variable, Discard, Write, Options.WriteValidations)
+	for Index = 2, #Discard.Content do
+		local Line = string.gsub(string.gsub(Discard.Content[Index], "^\t*", ""), "\n$", "")
+		Read:Line(Line)
+	end
+
+	local Offset = Read:Read(Size)
+	if Kind == "boolean" then
+		return `(buffer.readu8(RecieveBuffer, {Offset}) == 1)`
+	end
+
+	return `buffer.read{Kind}(RecieveBuffer, {Offset})`
+end
+
 function Declarations.Struct(Declaration: Parser.Struct, Read: Blocks.Block, Write: Blocks.Block, Variable: string)
 	local Value = Declaration.Value
-	Read:Line(`{Read:Declare(Variable)} = \{\} :: any`)
+
+	--> Name every field in the constructor so the table is presized instead of rehashing per field
+	local Template = {}
+	if PendingTagKey and PendingTagKey.Variable == Variable then
+		local Key = PendingTagKey.Key
+		local IsField = false
+		for _, Field in Value.Values do
+			IsField = IsField or (Field.Name == Key)
+		end
+
+		if not IsField then
+			table.insert(Template, `{FormatKey(Key)} = nil`)
+		end
+	end
+	PendingTagKey = nil
+
+	--> The constructor line is emitted first and filled in once every field is known.
+	--> Fixed size fields are read straight into it (fields stay in wire order, so offsets are unchanged),
+	--> everything else gets a nil slot and is read after it like before.
+	local Declared = Read:Declare(Variable)
+	Read:Line("")
+	local Slot = #Read.Content
 
 	for _, Field in Value.Values do
 		local Name = Field.Name
 		local FieldVariable = `{Variable}{FormatIndex(Name)}`
-		Generators.UserType(Field :: Type, Read, Write, FieldVariable)
+		--> Unsafe blocks (map loops) emit a Read() statement per operation, which can't live inside an expression
+		if not Read.Unsafe and IsInlineRead(Field :: Type) then
+			table.insert(Template, `{FormatKey(Name)} = {InlineRead(Field :: Type, Read, Write, FieldVariable)}`)
+		else
+			table.insert(Template, `{FormatKey(Name)} = nil`)
+			Generators.UserType(Field :: Type, Read, Write, FieldVariable)
+		end
 	end
+
+	Read.Content[Slot] = `{string.rep("\t", Read.Indent)}{Declared} = \{{table.concat(Template, ", ")}\} :: any\n`
 end
 
 function Declarations.Tuple(Declaration: Parser.Tuple, Read: Blocks.Block, Write: Blocks.Block)
@@ -304,7 +413,9 @@ function Declarations.TagEnum(Declaration: Parser.TagEnum, Read: Blocks.Block, W
 		Write:_lineFront(`buffer.writeu8(SendBuffer, {Allocation}, {Index - 1})`)
 		Write:Advance(1)
 
+		PendingTagKey = { Variable = Variable, Key = Tag }
 		Generators.UserType(Variant, Read, Write, Variable)
+		PendingTagKey = nil
 		Read:Line(`{TagIndex} = {Name}`)
 	end
 
@@ -348,7 +459,6 @@ function Declarations.Event(Declaration: Parser.Event)
 	--> Return body
 	local Body = Builder.new()
 	local Indent = Util.GetScopeIndent(Scope)
-	local WriteEvent = `{Util.GetPath(Identifier, true, Scope)}({Arguments})`
 
 	Body.Push(`{Declaration.Name} = \{`, 0, Indent)
 	Noop.Push(`{Declaration.Name} = \{`, 0, Indent)
@@ -362,22 +472,13 @@ function Declarations.Event(Declaration: Parser.Event)
 			Events.Push(`{Connection} = \{}`)
 		end
 
-		Events.Push(`{Queue} = table.create(256)`)
-		Block = (Channel.Listening == false) and Block:Compare("Index", Index, "Equals")
-			or Block:Branch("Conditional", "Index", Index, "Equals")
-
-		--> Update event block to branch block
-		if IsUnreliable then
-			Unreliables = Block
-		else
-			Reliables = Block
+		--> Only reliable events queue while there is no listener
+		if IsReliable then
+			Events.Push(`{Queue} = \{}`)
 		end
-
-		--> Update channel status
-		Channel.Listening = true
+		Block = DispatchBlock(Reliability, Index)
 
 		--> Event recieve body
-		local Listener: Blocks.Block
 		local ContextArguments = `Listener: ({Context == "Server" and "Player: Player, " or ""}{Values}) -> ()`
 		local ListenerArguments = `{Context == "Server" and "Player, " or ""}{Arguments}`
 
@@ -394,16 +495,6 @@ function Declarations.Event(Declaration: Parser.Event)
 		end
 
 		Block:Line(`local {Values} = {Util.GetPath(Identifier, false, Scope)}()`)
-
-		local Disconnect = Blocks.Function("", "", "()")
-		if IsSingle then
-			Disconnect = Disconnect:Compare(Connection, "Listener", "Equals"):Line(`{Connection} = nil`):End()
-		else
-			Disconnect = Disconnect:Line(`local Index = table.find({Connection}, Listener)`)
-			Disconnect = Disconnect:Compare("Index", "nil", "Not"):Line(`table.remove({Connection}, Index)`):End()
-		end
-
-		Disconnect = Disconnect:End():Wrap("return ", "")
 
 		if IsReliable then
 			local ListenerBound: Blocks.Block
@@ -424,42 +515,25 @@ function Declarations.Event(Declaration: Parser.Event)
 				:End()
 				:Line(`table.insert({Queue}, \{{ListenerArguments}\} :: \{any\})`)
 				:End()
-
-			Listener = Blocks.Function(Casing.On, ContextArguments, `() -> ()`, true)
-				:Line(IsSingle and `{Connection} = Listener` or `table.insert({Connection}, Listener)`)
-				:Iterator("Index", "Arguments", Queue)
-				:Line(IsSync and `Listener(table.unpack(Arguments))` or `task.spawn(Listener, table.unpack(Arguments))`)
-				:End()
-				:Line(`{Queue} = \{}`)
-				:Lines(Disconnect.Content, 1)
-				:End()
 		else
 			if IsSingle then
 				Block:Compare(Connection, "nil", "Not"):Lines(CallListener.Content, Block.Indent):End()
 			else
 				Block:Iterator("_", "Listener", Connection):Lines(CallListener.Content, Block.Indent):End()
 			end
-
-			Listener = Blocks.Function(Casing.On, ContextArguments, `() -> ()`, true)
-				:Line(IsSingle and `{Connection} = Listener` or `table.insert({Connection}, Listener)`)
-				:Lines(Disconnect.Content, 1)
-				:End()
 		end
 
+		--> Shared factories (see Base template) keep one copy of each On body instead of one per event
+		local Factory = IsSingle and "SingleListener" or "ManyListener"
+		Body.Push(
+			`{Casing.On} = {Factory}("{Reliability}", {Index}, {IsSync and "false" or "true"}, {IsReliable and "true" or "false"}) :: ({ContextArguments}) -> (() -> ()),`,
+			0,
+			Indent + 1
+		)
 		Noop.Push(`{Casing.On} = NOOP`, 0, Indent + 1)
-		Body.PushLines(Listener.Content, 0, Indent + 1)
 	elseif Value.From ~= Context and IsPolling then
 		Events.Push(`{Queue} = CreateQueue()`)
-		Block = (Channel.Listening == false) and Block:Compare("Index", Index, "Equals")
-			or Block:Branch("Conditional", "Index", Index, "Equals")
-
-		if IsUnreliable then
-			Unreliables = Block
-		else
-			Reliables = Block
-		end
-
-		Channel.Listening = true
+		Block = DispatchBlock(Reliability, Index)
 		Block:Line(
 			`Push({Queue}, table.pack({Context == "Server" and "Player, " or ""}{Util.GetPath(Identifier, false, Scope)}()))`
 		)
@@ -496,87 +570,25 @@ function Declarations.Event(Declaration: Parser.Event)
 		Body.Push("--- @deprecated v0.14.1 -- Use `Iter` instead.", 0, Indent + 1)
 		Body.PushLines(Deprecated.Content, 0, Indent + 1)
 	elseif Context == "Client" then
-		local Fire = Blocks.Function(Casing.Fire, Values, "()", true)
+		local Writer = Util.GetPath(Identifier, true, Scope)
 		if IsReliable then
-			Fire:Line(WriteEvent)
+			--> Reliable client fires only serialize, so the writer can be handed out directly
+			Body.Push(`{Casing.Fire} = {Writer} :: ({Values}) -> (),`, 0, Indent + 1)
 		else
-			Fire:Line(`local Previous = Save()`)
-			Fire:Line(`Load()`)
-			Fire:Line(WriteEvent)
-			Fire:Line("local Buffer = buffer.create(SendCursor)")
-			Fire:Line("buffer.copy(Buffer, 0, SendBuffer, 0, SendCursor)")
-			Fire:Line("Unreliable:FireServer(Buffer, SendInstances)")
-			Fire:Line("Load(Previous)")
+			Body.Push(`{Casing.Fire} = UnreliableFire({Writer}) :: ({Values}) -> (),`, 0, Indent + 1)
 		end
-		Fire:End()
 
 		Noop.Push(`{Casing.Fire} = NOOP`, 0, Indent + 1)
-		Body.PushLines(Fire.Content, 0, Indent + 1)
 	else
-		local Fire = Blocks.Function(Casing.Fire, `Player: Player, {Values}`, "()", true)
-		if IsReliable then
-			Fire:Line("Load(PlayersMap[Player])")
-			Fire:Line(WriteEvent)
-			Fire:Line("PlayersMap[Player] = Save()")
-		else
-			Fire:Line("Load()")
-			Fire:Line(WriteEvent)
-			Fire:Lines(UNRELIABLE_BODY, 1)
-			Fire:Line("Unreliable:FireClient(Player, Buffer, SendInstances)")
-		end
-		Fire:End()
-
-		local FireAll = Blocks.Function(Casing.FireAll, Values, "()", true)
-		if IsReliable then
-			FireAll:Line("Load()")
-			FireAll:Line(WriteEvent)
-			FireAll:Line(RELIABLE_BODY.Header)
-			FireAll:Iterator("_", "Player", "Players:GetPlayers()"):Lines(RELIABLE_BODY.Body, 2):End()
-		else
-			FireAll:Line("Load()")
-			FireAll:Line(WriteEvent)
-			FireAll:Lines(UNRELIABLE_BODY, 1)
-			FireAll:Line("Unreliable:FireAllClients(Buffer, SendInstances)")
-		end
-		FireAll:End()
-
-		local FireList = Blocks.Function(Casing.FireList, `List: \{Player\}, {Values}`, "()", true)
-		if IsReliable then
-			FireList:Line("Load()")
-			FireList:Line(WriteEvent)
-			FireList:Line(RELIABLE_BODY.Header)
-			FireList:Iterator("_", "Player", "List"):Lines(RELIABLE_BODY.Body, 2):End()
-		else
-			FireList:Line("Load()")
-			FireList:Line(WriteEvent)
-			FireList:Lines(UNRELIABLE_BODY, 1)
-			FireList:Iterator("_", "Player", "List"):Line("Unreliable:FireClient(Player, Buffer, SendInstances)"):End()
-		end
-		FireList:End()
-
-		local FireExcept = Blocks.Function(Casing.FireExcept, `Except: Player, {Values}`, "()", true)
-		if IsReliable then
-			FireExcept:Line("Load()")
-			FireExcept:Line(WriteEvent)
-			FireExcept:Line(RELIABLE_BODY.Header)
-			FireExcept:Iterator("_", "Player", "Players:GetPlayers()")
-				:Compare("Player", "Except", "Equals")
-				:Line("continue")
-				:End()
-				:Lines(RELIABLE_BODY.Body, 2)
-				:End()
-		else
-			FireExcept:Line("Load()")
-			FireExcept:Line(WriteEvent)
-			FireExcept:Lines(UNRELIABLE_BODY, 1)
-			FireExcept:Iterator("_", "Player", "Players:GetPlayers()")
-				:Compare("Player", "Except", "Equals")
-				:Line("continue")
-				:End()
-				:Line("Unreliable:FireClient(Player, Buffer, SendInstances)")
-				:End()
-		end
-		FireExcept:End()
+		--> Shared factories (see Server template) keep one copy of each Fire body instead of one per event
+		local Writer = Util.GetPath(Identifier, true, Scope)
+		local Prefix = IsReliable and "Reliable" or "Unreliable"
+		Body.PushLines({
+			`{Casing.Fire} = {Prefix}Fire({Writer}) :: (Player: Player, {Values}) -> (),\n`,
+			`{Casing.FireAll} = {Prefix}FireAll({Writer}) :: ({Values}) -> (),\n`,
+			`{Casing.FireList} = {Prefix}FireList({Writer}) :: (List: \{Player\}, {Values}) -> (),\n`,
+			`{Casing.FireExcept} = {Prefix}FireExcept({Writer}) :: (Except: Player, {Values}) -> (),\n`,
+		}, 0, Indent + 1)
 
 		Noop.PushLines({
 			`{Casing.Fire} = NOOP,\n`,
@@ -584,11 +596,6 @@ function Declarations.Event(Declaration: Parser.Event)
 			`{Casing.FireList} = NOOP,\n`,
 			`{Casing.FireExcept} = NOOP\n`,
 		}, 0, Indent + 1)
-
-		Body.PushLines(Fire:Wrap("", ",").Content, 0, Indent + 1)
-		Body.PushLines(FireAll:Wrap("", ",").Content, 0, Indent + 1)
-		Body.PushLines(FireList:Wrap("", ",").Content, 0, Indent + 1)
-		Body.PushLines(FireExcept:Wrap("", ",").Content, 0, Indent + 1)
 	end
 
 	Channel.Count += 1
@@ -657,12 +664,8 @@ function Declarations.Function(Declaration: Parser.Function)
 	Body.Push(`{Name} = \{`, 0, Indent)
 
 	--> Create queue and event branch
-	Events.Push(`{Queue} = table.create(256)`)
-	Block = (Channel.Listening == false) and Block:Compare("Index", Index, "Equals")
-		or Block:Branch("Conditional", "Index", Index, "Equals")
-
-	--> Update event block to branch block
-	Reliables = Block
+	Events.Push(`{Queue} = \{}`)
+	Block = DispatchBlock("Reliable", Index)
 
 	if Context == "Server" then
 		--> Data recieve body
@@ -696,7 +699,8 @@ function Declarations.Function(Declaration: Parser.Function)
 			Blocks.Function(Connection, `Player: Player, {DataValues}, InvocationIdentifier: number`, "()", true)
 				:Line(`local {ReturnValues};`)
 				:Lines(Serialize.Content, 1)
-				:Line("Load(PlayersMap[Player])")
+				:Line("local Send = Prepare(Player)")
+				:Line("Load(Send)")
 				:Compare("Success", "true", "Not")
 				:Line("local Position = Allocate(3)")
 				:Line(`buffer.writeu8(SendBuffer, Position, {Index})`)
@@ -706,7 +710,7 @@ function Declarations.Function(Declaration: Parser.Function)
 				:Branch("Default")
 				:Line(`{Util.GetPath(ReturnIdentifier, true, Scope)}({ReturnArguments}, InvocationIdentifier)`)
 				:End()
-				:Line("PlayersMap[Player] = Save()")
+				:Line("Commit(Send)")
 				:End()
 
 		local Listener = Blocks.Function(Casing.On, `Listener: (Player, {DataTypes}) -> ({ReturnTypes})`, "()", true)
@@ -809,6 +813,8 @@ function Declarations.Array(Declaration: Parser.Array, Read: Blocks.Block, Write
 	local Upper = Range.Max
 
 	local Iterator = `Item_{Read.Indent}`
+	--> Unique counter, element reads may declare their own "Index" local (e.g. enums)
+	local Counter = `Index_{Read.Indent}`
 	local IsVariableSize = (Lower ~= Upper)
 
 	--> Length
@@ -827,14 +833,87 @@ function Declarations.Array(Declaration: Parser.Array, Read: Blocks.Block, Write
 	--> Array
 	Read:Line(`{Read:Declare(Variable)} = table.create(Length)`)
 
+	--> Boolean arrays are bit packed, 8 per byte
+	if Of.Type == "Primitive" and (Of :: Parser.Primitive).Tokens.Primitive.Value == "boolean" then
+		local Suffix = Read.Indent
+		local Start, Full, Items = `BOOL_START_{Suffix}`, `BOOL_FULL_{Suffix}`, `BOOLS_{Suffix}`
+		local Count = `BOOL_COUNT_{Suffix}`
+
+		--> Write
+		--> Scoped in a do block so many boolean arrays in one function don't exhaust the local limit
+		Write:Line("do")
+		Write = Blocks.Block(Write)
+		Write:Line(`local {Items} = {Variable}`)
+		Write:Line(`local {Count} = {IsVariableSize and `#{Items}` or Upper}`)
+		if Options.WriteValidations then
+			Write:Loop("Index = 1", Count)
+				:Line(`local {Iterator} = {Items}[Index]`)
+				:Compare(`typeof({Iterator})`, `"boolean"`, "Not")
+				:Line(`error(\`Expected {Iterator} to be of type boolean, got \{type({Iterator})} instead.\`)`)
+				:End()
+				:End()
+		end
+
+		local Packed = {}
+		for Bit = 0, 7 do
+			table.insert(Packed, `(if {Items}[I + {Bit + 1}] then {2 ^ Bit} else 0)`)
+		end
+
+		Write:Line(`local {Start} = Allocate(({Count} + 7) // 8)`)
+		Write:Line(`local {Full} = {Count} // 8`)
+		Write:Loop("Byte = 0", `{Full} - 1`)
+			:Line("local I = Byte * 8")
+			:Line(`buffer.writeu8(SendBuffer, {Start} + Byte, {table.concat(Packed, " + ")})`)
+			:End()
+		Write:Compare(`{Count} % 8`, "0", "Not")
+			:Line("local Bits = 0")
+			:Line(`for I = {Full} * 8 + 1, {Count} do if {Items}[I] then Bits += bit32.lshift(1, I - {Full} * 8 - 1) end end`)
+			:Line(`buffer.writeu8(SendBuffer, {Start} + {Full}, Bits)`)
+			:End()
+		Write = Write:End()
+
+		--> Read
+		local Unpacked = {}
+		for Bit = 0, 7 do
+			table.insert(Unpacked, `{Items}[I + {Bit + 1}] = bit32.btest(Bits, {2 ^ Bit})`)
+		end
+
+		Read:Line("do")
+		Read = Blocks.Block(Read)
+		Read:Line(`local {Items} = {Variable}`)
+		Read:Line(`local {Start} = Read((Length + 7) // 8)`)
+		Read:Line(`local {Full} = Length // 8`)
+		Read:Loop("Byte = 0", `{Full} - 1`)
+			:Line(`local Bits = buffer.readu8(RecieveBuffer, {Start} + Byte)`)
+			:Line("local I = Byte * 8")
+			:Line(table.concat(Unpacked, "; "))
+			:End()
+		Read:Compare("Length % 8", "0", "Not")
+			:Line(`local Bits = buffer.readu8(RecieveBuffer, {Start} + {Full})`)
+			:Line(`for I = {Full} * 8 + 1, Length do {Items}[I] = bit32.btest(Bits, bit32.lshift(1, I - {Full} * 8 - 1)) end`)
+			:End()
+		Read = Read:End()
+
+		Read:Comment("END ARRAY")
+		Write:Comment("END ARRAY")
+		return
+	end
+
 	--> Body
-	Read = Read:Loop("Index = 1", "Length")
+	Read = Read:Loop(`{Counter} = 1`, "Length")
 	Write = Write:Loop("Index = 1", IsVariableSize and `#{Variable}` or Upper)
 
 	Write:Line(`local {Iterator} = {Variable}[Index]`)
 	Generators.UserType(Of, Read, Write, Iterator)
 
-	Read:Line(`table.insert({Variable}, {Iterator})`)
+	--> Elements that can be nil keep table.insert so receivers see the same (compacted) array as before
+	local Kind = (Of.Type == "Primitive") and (Of :: Parser.Primitive).Tokens.Primitive.Value or nil
+	local CanBeNil = (Of.Type == "Optional") or (Kind == "unknown") or (Kind == "Instance")
+	if CanBeNil then
+		Read:Line(`table.insert({Variable}, {Iterator})`)
+	else
+		Read:Line(`{Variable}[{Counter}] = {Iterator}`)
+	end
 
 	--> End
 	Read = Read:End()
@@ -1056,9 +1135,14 @@ function Generators.Export(Declaration: Type)
 		"RecieveBuffer = Buffer\n",
 	}, 1)
 
+	--> The client's reliable state lives in the globals between calls, so protect it from a previously errored write
+	if Context == "Client" then
+		Write:Line("DetachScratch()")
+	end
+
 	Write:Lines({
-		"local Previous = Save()\n",
-		"Load()\n",
+		"Save(Stash)\n",
+		"LoadScratch()\n",
 	}, 1)
 
 	Read:Advance(#Read.Content - 1)
@@ -1084,7 +1168,7 @@ function Generators.Export(Declaration: Type)
 	Write:Line("local Result = buffer.create(SendCursor)")
 	Write:Line("buffer.copy(Result, 0, SendBuffer, 0, SendCursor)")
 
-	Write:Line(`Load(Previous)`)
+	Write:Line(`Load(Stash)`)
 
 	--> End export
 	Read:Return(Returns)
@@ -1198,6 +1282,11 @@ function Generator.Reset()
 	Channels.Unreliable.Count = 0
 	Channels.Reliable.Listening = false
 	Channels.Unreliable.Listening = false
+
+	--> Reset dispatch
+	Dispatch.Reliable = {}
+	Dispatch.Unreliable = {}
+	PendingTagKey = nil
 end
 
 function Generator.Generate(FileContext: Context, AbstractSyntaxTree: Parser.Body): string
@@ -1256,12 +1345,16 @@ function Generator.Generate(FileContext: Context, AbstractSyntaxTree: Parser.Bod
 	--> Generate context source
 	local Source = Sources[Context]
 
-	if Channels.Reliable.Listening then
-		Reliables = Reliables:End()
-	end
+	for Channel, Entries in Dispatch do
+		if #Entries == 0 then
+			continue
+		end
 
-	if Channels.Unreliable.Listening then
-		Unreliables = Unreliables:End()
+		table.sort(Entries, function(A, B)
+			return A.Index < B.Index
+		end)
+
+		EmitDispatch((Channel == "Unreliable") and Unreliables or Reliables, Entries, 1, #Entries, 0)
 	end
 
 	Reliables = Reliables:End():End()
