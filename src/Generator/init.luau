@@ -58,11 +58,7 @@ local EVENT_SYNC_VALIDATION = {
 local RELIABLE_BODY = {
 	Header = "local Buffer, Size, Instances = SendBuffer, SendCursor, SendInstances",
 	Body = {
-		"Load(PlayersMap[Player])\n",
-		"local Position = Allocate(Size)\n",
-		"buffer.copy(SendBuffer, Position, Buffer, 0, Size)\n",
-		"table.move(Instances, 1, #Instances, #SendInstances + 1, SendInstances)\n",
-		"PlayersMap[Player] = Save()\n",
+		"Append(Player, Buffer, Size, Instances)\n",
 	},
 }
 
@@ -362,7 +358,7 @@ function Declarations.Event(Declaration: Parser.Event)
 			Events.Push(`{Connection} = \{}`)
 		end
 
-		Events.Push(`{Queue} = table.create(256)`)
+		Events.Push(`{Queue} = \{}`)
 		Block = (Channel.Listening == false) and Block:Compare("Index", Index, "Equals")
 			or Block:Branch("Conditional", "Index", Index, "Equals")
 
@@ -500,13 +496,13 @@ function Declarations.Event(Declaration: Parser.Event)
 		if IsReliable then
 			Fire:Line(WriteEvent)
 		else
-			Fire:Line(`local Previous = Save()`)
-			Fire:Line(`Load()`)
+			Fire:Line(`Save(Stash)`)
+			Fire:Line(`LoadScratch()`)
 			Fire:Line(WriteEvent)
 			Fire:Line("local Buffer = buffer.create(SendCursor)")
 			Fire:Line("buffer.copy(Buffer, 0, SendBuffer, 0, SendCursor)")
 			Fire:Line("Unreliable:FireServer(Buffer, SendInstances)")
-			Fire:Line("Load(Previous)")
+			Fire:Line("Load(Stash)")
 		end
 		Fire:End()
 
@@ -515,11 +511,12 @@ function Declarations.Event(Declaration: Parser.Event)
 	else
 		local Fire = Blocks.Function(Casing.Fire, `Player: Player, {Values}`, "()", true)
 		if IsReliable then
-			Fire:Line("Load(PlayersMap[Player])")
+			Fire:Line("local Send = PlayersMap[Player]")
+			Fire:Line("Load(Send)")
 			Fire:Line(WriteEvent)
-			Fire:Line("PlayersMap[Player] = Save()")
+			Fire:Line("PlayersMap[Player] = Save(Send)")
 		else
-			Fire:Line("Load()")
+			Fire:Line("LoadScratch()")
 			Fire:Line(WriteEvent)
 			Fire:Lines(UNRELIABLE_BODY, 1)
 			Fire:Line("Unreliable:FireClient(Player, Buffer, SendInstances)")
@@ -528,12 +525,12 @@ function Declarations.Event(Declaration: Parser.Event)
 
 		local FireAll = Blocks.Function(Casing.FireAll, Values, "()", true)
 		if IsReliable then
-			FireAll:Line("Load()")
+			FireAll:Line("LoadScratch()")
 			FireAll:Line(WriteEvent)
 			FireAll:Line(RELIABLE_BODY.Header)
 			FireAll:Iterator("_", "Player", "Players:GetPlayers()"):Lines(RELIABLE_BODY.Body, 2):End()
 		else
-			FireAll:Line("Load()")
+			FireAll:Line("LoadScratch()")
 			FireAll:Line(WriteEvent)
 			FireAll:Lines(UNRELIABLE_BODY, 1)
 			FireAll:Line("Unreliable:FireAllClients(Buffer, SendInstances)")
@@ -542,12 +539,12 @@ function Declarations.Event(Declaration: Parser.Event)
 
 		local FireList = Blocks.Function(Casing.FireList, `List: \{Player\}, {Values}`, "()", true)
 		if IsReliable then
-			FireList:Line("Load()")
+			FireList:Line("LoadScratch()")
 			FireList:Line(WriteEvent)
 			FireList:Line(RELIABLE_BODY.Header)
 			FireList:Iterator("_", "Player", "List"):Lines(RELIABLE_BODY.Body, 2):End()
 		else
-			FireList:Line("Load()")
+			FireList:Line("LoadScratch()")
 			FireList:Line(WriteEvent)
 			FireList:Lines(UNRELIABLE_BODY, 1)
 			FireList:Iterator("_", "Player", "List"):Line("Unreliable:FireClient(Player, Buffer, SendInstances)"):End()
@@ -556,7 +553,7 @@ function Declarations.Event(Declaration: Parser.Event)
 
 		local FireExcept = Blocks.Function(Casing.FireExcept, `Except: Player, {Values}`, "()", true)
 		if IsReliable then
-			FireExcept:Line("Load()")
+			FireExcept:Line("LoadScratch()")
 			FireExcept:Line(WriteEvent)
 			FireExcept:Line(RELIABLE_BODY.Header)
 			FireExcept:Iterator("_", "Player", "Players:GetPlayers()")
@@ -566,7 +563,7 @@ function Declarations.Event(Declaration: Parser.Event)
 				:Lines(RELIABLE_BODY.Body, 2)
 				:End()
 		else
-			FireExcept:Line("Load()")
+			FireExcept:Line("LoadScratch()")
 			FireExcept:Line(WriteEvent)
 			FireExcept:Lines(UNRELIABLE_BODY, 1)
 			FireExcept:Iterator("_", "Player", "Players:GetPlayers()")
@@ -657,7 +654,7 @@ function Declarations.Function(Declaration: Parser.Function)
 	Body.Push(`{Name} = \{`, 0, Indent)
 
 	--> Create queue and event branch
-	Events.Push(`{Queue} = table.create(256)`)
+	Events.Push(`{Queue} = \{}`)
 	Block = (Channel.Listening == false) and Block:Compare("Index", Index, "Equals")
 		or Block:Branch("Conditional", "Index", Index, "Equals")
 
@@ -696,7 +693,8 @@ function Declarations.Function(Declaration: Parser.Function)
 			Blocks.Function(Connection, `Player: Player, {DataValues}, InvocationIdentifier: number`, "()", true)
 				:Line(`local {ReturnValues};`)
 				:Lines(Serialize.Content, 1)
-				:Line("Load(PlayersMap[Player])")
+				:Line("local Send = PlayersMap[Player]")
+				:Line("Load(Send)")
 				:Compare("Success", "true", "Not")
 				:Line("local Position = Allocate(3)")
 				:Line(`buffer.writeu8(SendBuffer, Position, {Index})`)
@@ -706,7 +704,7 @@ function Declarations.Function(Declaration: Parser.Function)
 				:Branch("Default")
 				:Line(`{Util.GetPath(ReturnIdentifier, true, Scope)}({ReturnArguments}, InvocationIdentifier)`)
 				:End()
-				:Line("PlayersMap[Player] = Save()")
+				:Line("PlayersMap[Player] = Save(Send)")
 				:End()
 
 		local Listener = Blocks.Function(Casing.On, `Listener: (Player, {DataTypes}) -> ({ReturnTypes})`, "()", true)
@@ -1057,8 +1055,8 @@ function Generators.Export(Declaration: Type)
 	}, 1)
 
 	Write:Lines({
-		"local Previous = Save()\n",
-		"Load()\n",
+		"Save(Stash)\n",
+		"LoadScratch()\n",
 	}, 1)
 
 	Read:Advance(#Read.Content - 1)
@@ -1084,7 +1082,7 @@ function Generators.Export(Declaration: Type)
 	Write:Line("local Result = buffer.create(SendCursor)")
 	Write:Line("buffer.copy(Result, 0, SendBuffer, 0, SendCursor)")
 
-	Write:Line(`Load(Previous)`)
+	Write:Line(`Load(Stash)`)
 
 	--> End export
 	Read:Return(Returns)

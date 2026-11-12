@@ -39,10 +39,46 @@ local function StepReplication()
         buffer.copy(Buffer, 0, Send.Buffer, 0, Send.Cursor)
         Reliable:FireClient(Player, Buffer, Send.Instances)
 
-        Send.Size = 64
+        --> Keep the grown buffer around so the next frame doesn't have to regrow it
         Send.Cursor = 0
-        Send.Buffer = buffer.create(64)
         table.clear(Send.Instances)
+    end
+end
+
+--> Appends an already serialized packet to a player's reliable send buffer
+local function Append(Player: Player, Buffer: buffer, Size: number, Instances: {Instance})
+    local Send = PlayersMap[Player]
+    if not Send then
+        Send = {
+            Size = 64,
+            Cursor = 0,
+            Buffer = buffer.create(64),
+            Instances = {}
+        }
+        PlayersMap[Player] = Send
+    end
+
+    local Cursor = Send.Cursor
+    local InUse = Cursor + Size
+    if InUse > Send.Size then
+        local NewSize = Send.Size
+        while InUse > NewSize do
+            NewSize *= 1.5
+        end
+
+        local NewBuffer = buffer.create(NewSize)
+        buffer.copy(NewBuffer, 0, Send.Buffer, 0, Cursor)
+        Send.Size = NewSize
+        Send.Buffer = NewBuffer
+    end
+
+    buffer.copy(Send.Buffer, Cursor, Buffer, 0, Size)
+    Send.Cursor = InUse
+
+    local Count = #Instances
+    if Count > 0 then
+        local Target = Send.Instances
+        table.move(Instances, 1, Count, #Target + 1, Target)
     end
 end
 ]]

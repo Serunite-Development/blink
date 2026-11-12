@@ -18,10 +18,9 @@ local function StepReplication()
     buffer.copy(Buffer, 0, SendBuffer, 0, SendCursor)
     Reliable:FireServer(Buffer, SendInstances)
 
-    SendSize = 64
+    --> Keep the grown buffer around so the next frame doesn't have to regrow it
     SendCursor = 0
     SendOffset = 0
-    SendBuffer = buffer.create(64)
     table.clear(SendInstances)
 end
 ]]

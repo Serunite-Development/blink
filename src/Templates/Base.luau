@@ -37,7 +37,28 @@ local function Read(Bytes: number)
     return Offset
 end
 
-local function Save(): BufferSave
+--> Reusable send state for one-shot writes (FireAll/FireList/FireExcept, unreliables, exports)
+--> so they don't allocate a fresh buffer and instance table on every call.
+local ScratchBuffer = buffer.create(64)
+local ScratchInstances = {}
+
+--> Single reusable slot for Save/Load round-trips, these are never nested.
+local Stash: BufferSave = {
+    Size = 0,
+    Cursor = 0,
+    Buffer = ScratchBuffer,
+    Instances = ScratchInstances
+}
+
+local function Save(Into: BufferSave?): BufferSave
+    if Into then
+        Into.Size = SendSize
+        Into.Cursor = SendCursor
+        Into.Buffer = SendBuffer
+        Into.Instances = SendInstances
+        return Into
+    end
+
     return {
         Size = SendSize,
         Cursor = SendCursor,
@@ -63,6 +84,15 @@ local function Load(Save: BufferSave?)
     SendInstances = {}
 end
 
+local function LoadScratch()
+    SendSize = buffer.len(ScratchBuffer)
+    SendCursor = 0
+    SendOffset = 0
+    SendBuffer = ScratchBuffer
+    table.clear(ScratchInstances)
+    SendInstances = ScratchInstances
+end
+
 local function Invoke()
     if Invocations == 255 then
         Invocations = 0
@@ -83,6 +113,9 @@ local function Allocate(Bytes: number)
 
         local Buffer = buffer.create(SendSize)
         buffer.copy(Buffer, 0, SendBuffer, 0, SendCursor)
+        if SendBuffer == ScratchBuffer then
+            ScratchBuffer = Buffer
+        end
         SendBuffer = Buffer
     end
 
@@ -129,13 +162,13 @@ end
 local Calls = table.create(256)
 
 local Events: any = {
-    Reliable = table.create(256),
-    Unreliable = table.create(256)
+    Reliable = {},
+    Unreliable = {}
 }
 
 local Queue: any = {
-    Reliable = table.create(256),
-    Unreliable = table.create(256)
+    Reliable = {},
+    Unreliable = {}
 }
 
 ]]
